@@ -126,12 +126,14 @@ def test_office_conversion_never_replaces_uploaded_preview(
 
     async def collect() -> list[tuple[object, ...]]:
         """消费完整生成器并检查每一次前端预览更新。"""
-        return [await handler(str(source), 0, "")]
+        # 12 个输入：file + tier + page_range + force_ocr + 8 translation args (off)
+        return [await handler(str(source), 0, "", False, False, "auto", "en", "", "", "", 1, "")]
 
     updates = asyncio.run(collect())
     assert updates and all(update[2:6] == ({"__type__": "update"},) * 4 for update in updates)
     assert bool(updates[-1][6]) is (outcome == "success")
-    assert all(item["interactive"] is (outcome == "success") for item in updates[-1][8:15])
+    # 7 个原文下载按钮在 outputs[15:22]（翻译 7 个输出插入后向后偏移）
+    assert all(item["interactive"] is (outcome == "success") for item in updates[-1][15:22])
     if outcome == "success":
         assert "hello-0" in updates[-1][1]
     else:

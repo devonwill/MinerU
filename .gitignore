@@ -67,5 +67,23 @@ output/
 # E2E 测试工作目录（.e2e/fixtures-cache 跨 session 复用）
 .e2e/
 
+# 本地模型缓存目录（体积大，不进版本库）
+#  - .e2e_home/: E2E 测试下载的模型
+#  - .mineru_home/: 本地 mineru 运行时模型缓存
+.e2e_home/
+.mineru_home/
+
+# 常见模型权重文件格式
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+*.bin
+*.gguf
+*.onnx
+*.pb
+*.h5
+*.keras
+
 htmlcov/
 .zcode/

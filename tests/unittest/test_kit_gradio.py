@@ -1083,7 +1083,7 @@ def test_gradio_ocr_control_visibility_reset_and_event_binding(tmp_path: Path) -
     for path, visible in (("first.pdf", True), ("second.PDF", True), ("photo.png", False), ("book.docx", False), (None, False)):
         assert update.fn(path) == {"__type__": "update", "value": False, "visible": visible}
     convert = next(fn for fn in demo.fns.values() if fn.name == "convert_handler")
-    assert convert.inputs[-1] is checkbox
+    assert checkbox in convert.inputs
     slider = next(block for block in demo.blocks.values() if "mineru-tier-slider" in (block.elem_classes or []))
     clear = next(block for block in demo.blocks.values() if block.__class__.__name__ == "ClearButton")
     events = demo.config["dependencies"]
@@ -1165,6 +1165,7 @@ def test_build_gradio_app_exposes_html_tab_and_download_menu(tmp_path: Path) -> 
     assert [label.key for label in tab_labels] == [
         "mineru.markdown",
         "mineru.json_view",
+        "mineru.translate_tab",
     ]
     download_buttons = [
         component
@@ -1179,7 +1180,7 @@ def test_build_gradio_app_exposes_html_tab_and_download_menu(tmp_path: Path) -> 
         component for component in app.blocks.values() if component.__class__.__name__ == "File" and component.visible
     ]
     assert len(file_inputs) == 1
-    assert file_inputs[0].file_count == "single"
+    assert file_inputs[0].file_count == "multiple"
     assert set(file_inputs[0].file_types) == {f".{extension}" for extension in PARSEABLE_EXTENSIONS}
     preview_handler = next(fn.fn for fn in app.fns.values() if fn.name == "update_file_preview")
     assert preview_handler("report.pdf")[0] == {
@@ -1206,9 +1207,9 @@ def test_build_gradio_app_exposes_html_tab_and_download_menu(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("tiers", "default_position", "default_tier", "maximum"),
     [
-        (("advanced", "flash", "standard", "basic"), 2, "standard", 3),
-        (("advanced", "standard", "basic"), 1, "standard", 2),
-        (("flash", "basic", "standard"), 2, "standard", 2),
+        (("advanced", "flash", "standard", "basic"), 1, "basic", 3),
+        (("advanced", "standard", "basic"), 0, "basic", 2),
+        (("flash", "basic", "standard"), 1, "basic", 2),
         (("advanced", "flash"), 1, "advanced", 1),
         (("basic", "flash"), 1, "basic", 1),
         (("flash",), 0, "flash", 1),
@@ -1223,7 +1224,11 @@ def test_gradio_tier_slider_uses_available_tiers_and_preserves_selection(
     demo = build_gradio_app(
         V1ArtifactClient(api_url=capabilities.base_url), capabilities, output_root=tmp_path, enable_example=False
     )
-    slider = next(block for block in demo.blocks.values() if block.__class__.__name__ == "Slider")
+    slider = next(
+        block
+        for block in demo.blocks.values()
+        if block.__class__.__name__ == "Slider" and "mineru-tier-slider" in (block.elem_classes or [])
+    )
     label = next(block for block in demo.blocks.values() if "mineru-tier-label" in (block.elem_classes or []))
     assert (slider.minimum, slider.maximum, slider.step, slider.precision) == (0, maximum, 1, 0)
     assert slider.value == default_position
@@ -1235,15 +1240,17 @@ def test_gradio_tier_slider_uses_available_tiers_and_preserves_selection(
             default_tier
         ]
     )
-    assert not any(block.__class__.__name__ == "Dropdown" for block in demo.blocks.values())
+    # 翻译设置区使用三个下拉：源语言、目标语言与服务商预设。
+    dropdowns = [block for block in demo.blocks.values() if block.__class__.__name__ == "Dropdown"]
+    assert len(dropdowns) == 3
     label_events = [event for event in demo.config["dependencies"] if (slider._id, "input") in event["targets"]]
     assert len(label_events) == 1
     label_event = label_events[0]
     assert label_event["backend_fn"] is False
     assert label_event["queue"] is False
     assert label_event["trigger_mode"] == "always_last"
-    assert label_event["outputs"][7:9] == [slider._id, label._id]
-    preference = demo.blocks[label_event["outputs"][9]]
+    assert [slider._id, label._id] == label_event["outputs"][9:11]
+    preference = demo.blocks[label_event["outputs"][11]]
     assert preference.visible is False
     assert json.loads(preference.value) == {"tier": default_tier, "locked": False}
     assert preference._id in label_event["inputs"]
@@ -1297,7 +1304,8 @@ def test_gradio_flash_only_input_requires_available_flash(tmp_path: Path, tiers:
     assert "tier_unavailable" in updates[-1][0]
     assert "该格式仅支持 Flash，当前服务不可用" in updates[-1][0]
     assert updates[-1][6] is None
-    assert all(item["interactive"] is False for item in updates[-1][8:15])
+    assert all(item["interactive"] is False for item in updates[-1][9:14])
+    assert all(item["interactive"] is False for item in updates[-1][15:22])
     client.parse_file.assert_not_called()
 
 
@@ -1360,10 +1368,10 @@ def test_gradio_conversion_forwards_page_range_and_enables_fresh_downloads(
     updates = asyncio.run(collect_updates(convert_handler))
 
     assert client.calls == [(source.resolve(), expected_tier, "1")]
-    assert len(updates[-1]) == 16
-    assert updates[-1][7] == Path(updates[-1][6]["root"]).name
+    assert len(updates[-1]) == 23
+    assert updates[-1][14] == Path(updates[-1][6]["root"]).name
     assert updates[-1][6] is not None
-    assert all(update["interactive"] is True for update in updates[-1][8:15])
+    assert all(update["interactive"] is True for update in updates[-1][15:22])
     assert len(updates) == 1
 
 
@@ -1421,7 +1429,8 @@ def test_gradio_conversion_rejects_invalid_tier_position(tmp_path: Path, tiers: 
     updates = asyncio.run(collect_updates())
     assert "Failed: Invalid tier slider position" in updates[-1][0]
     assert updates[-1][6] is None
-    assert all(item["interactive"] is False for item in updates[-1][8:15])
+    assert all(item["interactive"] is False for item in updates[-1][9:14])
+    assert all(item["interactive"] is False for item in updates[-1][15:22])
     client.parse_file.assert_not_called()
 
 
@@ -1454,7 +1463,8 @@ def test_gradio_conversion_failure_clears_previous_downloads(tmp_path: Path) -> 
 
     assert "Failed: boom" in update[0]
     assert update[6] is None
-    assert all(item["interactive"] is False for item in update[8:15])
+    assert all(item["interactive"] is False for item in update[9:14])
+    assert all(item["interactive"] is False for item in update[15:22])
 
 
 @pytest.mark.parametrize("explicit_session_cancel", [False, True])
@@ -1511,8 +1521,20 @@ def test_gradio_local_queue_cancellation_releases_slot_and_keeps_sessions_isolat
                 await asyncio.sleep(0.005)
             raise AssertionError(f"未出现阶段：{marker}")
 
+        async def run_ui(source: Path, ticket: str, request: SimpleNamespace) -> str:
+            """耗尽 convert_ui 异步生成器，返回最后一份回执；取消时返回空串。"""
+            last = ""
+            try:
+                async for receipt in ui(
+                    str(source), 0, "", False, False, "auto", "", "", "", "", 1, "", ticket, request
+                ):
+                    last = receipt
+            except asyncio.CancelledError:
+                return ""
+            return last
+
         first, second, third = [
-            asyncio.create_task(ui(str(source), 0, "", False, ticket, request))
+            asyncio.create_task(run_ui(source, ticket, request))
             for source, ticket, request in zip(sources, tickets, requests)
         ]
         try:
@@ -1537,8 +1559,10 @@ def test_gradio_local_queue_cancellation_releases_slot_and_keeps_sessions_isolat
             finish.set()
             final = json.loads(await third)["outputs"]
             assert "Completed (" in final[0]
-            assert final[6].startswith(sources[2].stem)
-            assert all(item["interactive"] is True for item in final[7:14])
+            assert final[13] == sources[2].stem or final[13].startswith(sources[2].stem)
+            # 回执已剔除 artifact_state：未启用翻译时译文按钮 [8:13] 保持禁用，原文按钮 [14:21] 可下载。
+            assert all(item["interactive"] is False for item in final[8:13])
+            assert all(item["interactive"] is True for item in final[14:21])
         finally:
             finish.set()
             await asyncio.gather(first, second, third, return_exceptions=True)
@@ -1576,7 +1600,8 @@ def test_gradio_output_failure_stops_timer_and_allows_next_conversion(tmp_path: 
             assert "Failed: output disk unavailable" in updates[-1][0]
             assert "is-error" in updates[-1][0]
             assert updates[-1][6] is None
-            assert all(item["interactive"] is False for item in updates[-1][8:15])
+            assert all(item["interactive"] is False for item in updates[-1][9:14])
+            assert all(item["interactive"] is False for item in updates[-1][15:22])
 
     asyncio.run(scenario())
 
@@ -1689,9 +1714,17 @@ def test_gradio_slow_precheck_keeps_polling_available_and_queues_other_sessions(
         """预检线程阻塞时仍可独立查询准备和排队状态。"""
         requests = [SimpleNamespace(session_hash=f"s{i}") for i in range(2)]
         tickets = [json.dumps({"run_id": f"{i + 1:032x}", "revision": 1}) for i in range(2)]
+        async def run_ui(ticket: str, request: SimpleNamespace) -> str:
+            """耗尽 convert_ui 异步生成器，拼接各回执供后续断言包含错误文案。"""
+            parts: list[str] = []
+            async for receipt in handler(
+                str(source), 0, "", False, False, "auto", "", "", "", "", 1, "", ticket, request
+            ):
+                parts.append(receipt)
+            return "".join(parts)
+
         first, second = [
-            asyncio.create_task(handler(str(source), 0, "", False, ticket, request))
-            for ticket, request in zip(tickets, requests)
+            asyncio.create_task(run_ui(ticket, request)) for ticket, request in zip(tickets, requests)
         ]
         try:
             for _ in range(600):

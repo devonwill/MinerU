@@ -25,11 +25,24 @@ class ConversionRun:
     terminal: bool = False
     task: asyncio.Task[tuple[Any, ...]] | None = None
     artifacts: dict[str, Any] | None = None
+    # 多文件队列共享同一个 run：只有最后一个文件完成或失败才收敛为终态。
+    total_files: int = 1
+    completed_files: int = 0
+    _file_closed: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         """使用浏览器或 API 分配的唯一标识初始化准备阶段。"""
         self.state = StatusPanelState(run_id=self.run_id)
         self.publish(STATUS_PREPARING_REQUEST)
+
+    def set_queue(self, total_files: int) -> None:
+        """在开始执行前登记本 run 需要串行处理的文件总数。"""
+        self.total_files = max(1, total_files)
+
+    def begin_file(self) -> None:
+        """进入下一个文件，允许其成功或失败通知再次写入同一会话状态。"""
+        self._file_closed = False
+        self.terminal = False
 
     def publish(self, message: str | ParseStatusUpdate, *, at: float | None = None, final_failure: bool = False) -> None:
         """最终错误可补全已有失败快照，成功、取消和迟到通知仍受终态保护。"""
@@ -37,7 +50,12 @@ class ConversionRun:
         replace_failure = final_failure and self.state.message.startswith("Failed:") and text.startswith("Failed:")
         if self.cancelled or (self.terminal and not replace_failure) or not self.state.append(message, at=at):
             return
-        self.terminal = self.state.message == STATUS_COMPLETED or self.state.message.startswith("Failed:")
+        # 每个文件的首个终态消息（Completed/Failed）计数一次；中间文件不把整个 run 置为终态。
+        message_terminal = self.state.message == STATUS_COMPLETED or self.state.message.startswith("Failed:")
+        if message_terminal and not self._file_closed:
+            self._file_closed = True
+            self.completed_files += 1
+        self.terminal = message_terminal and self.completed_files >= self.total_files
         self.snapshot = json.dumps(
             {
                 "run_id": self.run_id,

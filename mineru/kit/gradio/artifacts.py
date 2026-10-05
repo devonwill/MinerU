@@ -35,12 +35,22 @@ from ...render import (
     MarkdownRenderOptions,
     PdfRenderOptions,
     RenderFormat,
+    RenderMode,
     StructuredContentRenderOptions,
     render,
 )
 from ...types import BlockBase, ImagePayloadBlock, MiddleJson
+from .translation import (
+    build_translation_docx,
+    build_translation_json,
+    build_translation_latex,
+    build_translation_pdf,
+)
 
 DownloadFormat = Literal["markdown", "json", "html", "docx", "latex", "epub", "pdf"]
+# 译文由 Gradio 层直接从译文 Markdown 渲染，不经过 MiddleJson，故不含 html/epub。
+TranslationDownloadFormat = Literal["markdown", "json", "docx", "latex", "pdf"]
+_TRANSLATION_FORMAT_NAMES: frozenset[str] = frozenset({"markdown", "json", "docx", "latex", "pdf"})
 
 
 @contextmanager
@@ -64,11 +74,14 @@ class RunArtifacts:
     source_path: Path
     middle_json_path: Path
     markdown_path: Path
+    # 翻译专用 FULL 模式 Markdown：含 "\n\n---\n\n" 页分隔符，供逐页翻译切分。
+    translation_markdown_path: Path
     structured_content_path: Path
     downloads_dir: Path
     file_suffix: str
     origin_pdf_path: Path | None = None
     layout_pdf_path: Path | None = None
+    translation_path: Path | None = None
     page_indices: tuple[int, ...] = ()
     generated_downloads: dict[str, Path] = field(default_factory=dict)
 
@@ -76,15 +89,17 @@ class RunArtifacts:
         """转换为可安全放入 Gradio State 的纯字符串字典。"""
         return {
             "root": str(self.root),
-            "stem": self.stem,
+            "stem": str(self.stem),
             "source_path": str(self.source_path),
             "middle_json_path": str(self.middle_json_path),
             "markdown_path": str(self.markdown_path),
+            "translation_markdown_path": str(self.translation_markdown_path),
             "structured_content_path": str(self.structured_content_path),
             "downloads_dir": str(self.downloads_dir),
             "file_suffix": self.file_suffix,
             "origin_pdf_path": str(self.origin_pdf_path) if self.origin_pdf_path else "",
             "layout_pdf_path": str(self.layout_pdf_path) if self.layout_pdf_path else "",
+            "translation_path": str(self.translation_path) if self.translation_path else "",
             "page_indices": list(self.page_indices),
             "generated_downloads": {key: str(value) for key, value in self.generated_downloads.items()},
         }
@@ -100,6 +115,7 @@ class RunArtifacts:
             "source_path",
             "middle_json_path",
             "markdown_path",
+            "translation_markdown_path",
             "structured_content_path",
             "downloads_dir",
             "file_suffix",
@@ -128,13 +144,14 @@ class RunArtifacts:
                 "source_path",
                 "middle_json_path",
                 "markdown_path",
+                "translation_markdown_path",
                 "structured_content_path",
                 "downloads_dir",
             )
         ]
         for path in core_paths:
             _ensure_path_inside(root, path)
-        optional_paths = [_optional_path(state.get(key)) for key in ("origin_pdf_path", "layout_pdf_path")]
+        optional_paths = [_optional_path(state.get(key)) for key in ("origin_pdf_path", "layout_pdf_path", "translation_path")]
         for path in optional_paths:
             if path is not None:
                 _ensure_path_inside(root, path)
@@ -144,11 +161,13 @@ class RunArtifacts:
             source_path=Path(cast(str, state["source_path"])).resolve(),
             middle_json_path=Path(cast(str, state["middle_json_path"])).resolve(),
             markdown_path=Path(cast(str, state["markdown_path"])).resolve(),
+            translation_markdown_path=Path(cast(str, state["translation_markdown_path"])).resolve(),
             structured_content_path=Path(cast(str, state["structured_content_path"])).resolve(),
             downloads_dir=Path(cast(str, state["downloads_dir"])).resolve(),
             file_suffix=cast(str, state["file_suffix"]),
             origin_pdf_path=optional_paths[0],
             layout_pdf_path=optional_paths[1],
+            translation_path=optional_paths[2],
             page_indices=page_indices,
             generated_downloads=generated_downloads,
         )
@@ -203,6 +222,7 @@ def create_run_artifacts(source_path: Path, output_root: Path) -> RunArtifacts:
         source_path=source_copy,
         middle_json_path=root / "middle_json.json",
         markdown_path=root / "markdown.md",
+        translation_markdown_path=root / "translation_source.md",
         structured_content_path=root / "structured_content.json",
         downloads_dir=downloads_dir,
         file_suffix=source_suffix.removeprefix("."),
@@ -256,6 +276,17 @@ def persist_parse_result(
                 ),
             )
             artifacts.markdown_path.write_text(markdown, encoding="utf-8")
+            # FULL 模式保留页边界并以 "\n\n---\n\n" 连接，专供翻译逐页切分；
+            # 不替换上面的 DEFAULT markdown.md，避免改变面向下载用户的既有产物。
+            translation_markdown = cast(
+                str,
+                render(
+                    materialized,
+                    RenderFormat.MARKDOWN,
+                    options=MarkdownRenderOptions(mode=RenderMode.FULL),
+                ),
+            )
+            artifacts.translation_markdown_path.write_text(translation_markdown, encoding="utf-8")
         with _output_stage("structured_json", artifacts):
             structured = cast(
                 dict[str, Any],
@@ -455,6 +486,80 @@ def render_download(
     _ensure_path_inside(artifacts.root, target)
     artifacts.generated_downloads[download_format] = target
     return str(target)
+
+
+def render_translation_download(
+    artifacts_state: object,
+    format_name: str,
+    *,
+    allowed_root: Path | None = None,
+) -> str:
+    """从已保存的译文 Markdown 按需生成指定格式的译文文件，并返回绝对路径。
+
+    译文渲染只发生在 Gradio 层，不经过 MiddleJson 与解析协议；markdown 直接复用
+    翻译阶段写好的文件，其余四种格式在此按需渲染并缓存。
+    """
+    artifacts = RunArtifacts.from_state(artifacts_state)
+    if allowed_root is not None:
+        _ensure_path_inside(allowed_root.resolve(), artifacts.root)
+        _ensure_path_inside(artifacts.root, artifacts.downloads_dir)
+    if format_name not in _TRANSLATION_FORMAT_NAMES:
+        raise ValueError(f"Unsupported translation download format: {format_name}")
+    translation_format = cast(TranslationDownloadFormat, format_name)
+    translation_path = artifacts.translation_path
+    if translation_path is None or not translation_path.is_file():
+        raise ValueError("当前结果没有译文，请先勾选全文翻译后重新解析。")
+    _ensure_path_inside(artifacts.root, translation_path)
+    # markdown 直接复用翻译阶段落盘的文件，无需再渲染或缓存。
+    if translation_format == "markdown":
+        return str(translation_path)
+    cache_key = f"translation_{translation_format}"
+    cached = artifacts.generated_downloads.get(cache_key)
+    if cached is not None and cached.is_file():
+        return str(cached)
+    markdown_text = translation_path.read_text(encoding="utf-8")
+    # 译文图片仍使用原文物化的 images/ 目录，故以任务根目录作为相对链接基准。
+    assets_dir = artifacts.root
+    target: Path
+    if translation_format == "json":
+        target = artifacts.downloads_dir / f"{artifacts.stem}_translation.json"
+        _ensure_path_inside(artifacts.root, target)
+        target.write_text(build_translation_json(markdown_text), encoding="utf-8")
+    elif translation_format == "docx":
+        target = artifacts.downloads_dir / f"{artifacts.stem}_translation.docx"
+        _ensure_path_inside(artifacts.root, target)
+        build_translation_docx(markdown_text, target, assets_dir=assets_dir)
+    elif translation_format == "pdf":
+        target = artifacts.downloads_dir / f"{artifacts.stem}_translation.pdf"
+        _ensure_path_inside(artifacts.root, target)
+        build_translation_pdf(markdown_text, target, assets_dir=assets_dir)
+    else:
+        # LaTeX 的 \\includegraphics 只引用文件名，故图片需扁平复制到 .tex 同级目录。
+        target = artifacts.downloads_dir / f"{artifacts.stem}_translation_latex.zip"
+        latex_root = artifacts.downloads_dir / "translation_latex"
+        _ensure_path_inside(artifacts.root, target)
+        _ensure_path_inside(artifacts.root, latex_root)
+        latex_root.mkdir(parents=True, exist_ok=True)
+        _copy_flat_images(artifacts.root / "images", latex_root)
+        build_translation_latex(markdown_text, latex_root / f"{artifacts.stem}_translation.tex", assets_dir=assets_dir)
+        _zip_directory(latex_root, target)
+    _ensure_path_inside(artifacts.root, target)
+    artifacts.generated_downloads[cache_key] = target
+    return str(target)
+
+
+def _copy_flat_images(images_dir: Path, output_dir: Path) -> None:
+    """把图片扁平复制到输出目录，匹配 LaTeX 正文中仅含文件名的图片引用。"""
+    _ensure_path_inside(images_dir.parent, images_dir)
+    for source in sorted(images_dir.rglob("*")):
+        _ensure_path_inside(images_dir, source)
+        if source.is_symlink():
+            raise ValueError(f"Image assets must not contain symlinks: {source}")
+        if source.is_file():
+            # 不同子目录下的同名图片会相互覆盖；MinerU 物化图片以全局唯一 ID 命名，实际不会冲突。
+            target = output_dir / source.name
+            _ensure_path_inside(output_dir, target)
+            shutil.copyfile(source, target)
 
 
 def _prepare_origin_pdf(
@@ -688,9 +793,11 @@ def _safe_stem(value: str) -> str:
 
 __all__ = [
     "DownloadFormat",
+    "TranslationDownloadFormat",
     "RunArtifacts",
     "create_run_artifacts",
     "render_html_preview",
     "persist_parse_result",
     "render_download",
+    "render_translation_download",
 ]

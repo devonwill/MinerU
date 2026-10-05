@@ -20,6 +20,7 @@ from mineru.kit.gradio import app as gradio_app
 from mineru.kit.gradio.client import V1ArtifactError, V1ServerCapabilities
 from mineru.kit.gradio.conversion import ConversionRun, SessionConversions
 from mineru.kit.gradio.status import STATUS_COMPLETED, STATUS_PROCESSING_ON_SERVER
+from mineru.kit.gradio.translation import DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE
 from mineru.parser.base import ParseResult
 from tests.unittest.test_kit_gradio import _middle_json, _pdf_bytes
 
@@ -39,9 +40,29 @@ def _callback(app: Any, name: str) -> Any:
     return next(fn.fn for fn in app.fns.values() if fn.name == name)
 
 
+def _session_downloader(app: Any) -> Any:
+    """译文下载 handler 注册在前，按返回注解挑出会话产物下载（译文的返回 str | None）。"""
+    return next(
+        fn.fn for fn in app.fns.values() if fn.name == "handler" and fn.fn.__annotations__.get("return") == "tuple[Any, str]"
+    )
+
+
+async def _receipts(fn: Any, *args: Any) -> str | None:
+    """convert_ui 是异步生成器：逐份消费并返回最后一份回执，没有下发时为 None。"""
+    final: str | None = None
+    async for receipt in fn(*args):
+        final = receipt
+    return final
+
+
 def _ticket(index: int) -> str:
     """生成有序浏览器提交，用于模拟响应乱序和取消先到。"""
     return json.dumps({"run_id": f"{index:032x}", "revision": index})
+
+
+def _translation_off() -> tuple[Any, ...]:
+    """“不启用翻译”的 8 个位置参数；语言填下拉默认值，才能通过 process_api 的 Dropdown 预处理。"""
+    return (False, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE, "", "", "", 1, "")
 
 
 def _conversions(app: Any) -> SessionConversions:
@@ -62,21 +83,23 @@ def test_public_conversion_releases_runs(tmp_path: Path, with_session: bool, out
         client.parse_file.side_effect = asyncio.CancelledError()
     app = _application(tmp_path, client)
     convert = _callback(app, "convert_handler")
-    downloader = _callback(app, "handler")
+    downloader = _session_downloader(app)
     conversions = _conversions(app)
 
     async def scenario() -> None:
         """连续使用不同 API 会话，确认注册表不会随请求数量增长。"""
         for index in range(3):
             request = SimpleNamespace(session_hash=f"api-{index}") if with_session else None
-            response = await convert(None if outcome == "input_error" else str(source), 0, "", False, request)
-            assert len(response) == 16
+            source_arg = None if outcome == "input_error" else str(source)
+            response = await convert(source_arg, 0, "", False, *_translation_off(), request)
+            assert len(response) == 23
             assert conversions.runs == {}
             assert conversions.revisions == {}
             if outcome == "success":
                 state = response[6]
                 assert state and Path(state["root"]).is_dir()
-                path, receipt = downloader(state, json.dumps({"run_id": response[7]}), request)
+                # 公开响应第 14 位是 active_run_id（第 7-13 位为译文预览与译文按钮）。
+                path, receipt = downloader(state, json.dumps({"run_id": response[14]}), request)
                 assert path and Path(path).is_file() and not json.loads(receipt)["error"]
             elif outcome != "cancelled":
                 assert "Failed:" in response[0] and response[6] is None
@@ -108,17 +131,19 @@ def test_public_cleanup_preserves_replacement_ui_run(tmp_path: Path) -> None:
 
     async def scenario() -> None:
         """以真实回调触发替换，并验证新任务完成后的快照仍可轮询。"""
-        first = asyncio.create_task(public(str(source), 0, "", False, request))
+        first = asyncio.create_task(public(str(source), 0, "", False, *_translation_off(), request))
         second = None
         try:
             await asyncio.wait_for(first_started.wait(), 3)
-            second = asyncio.create_task(ui(str(source), 0, "", False, _ticket(1), request))
+            second = asyncio.create_task(_receipts(ui, str(source), 0, "", False, *_translation_off(), _ticket(1), request))
             await asyncio.wait_for(second_started.wait(), 3)
             await asyncio.wait_for(first, 3)
             assert _conversions(app).current("replacement", f"{1:032x}") is not None
             assert not second.done()
             release.set()
-            receipt = json.loads(await asyncio.wait_for(second, 3))
+            receipt_text = await asyncio.wait_for(second, 3)
+            assert receipt_text is not None
+            receipt = json.loads(receipt_text)
             snapshot = json.loads(poll(_ticket(1), request))
             assert snapshot["terminal"] and snapshot["sequence"] == receipt["sequence"]
             assert "Completed" in receipt["outputs"][0]
@@ -153,7 +178,11 @@ def test_final_error_replaces_provisional_failure(tmp_path: Path, status: str, b
     async def scenario() -> None:
         """最终回执可覆盖已到达的失败快照，随后普通通知不能覆盖错误。"""
         if browser:
-            receipt = json.loads(await _callback(app, "convert_ui")(str(source), 0, "", False, _ticket(1), request))
+            receipt_text = await _receipts(
+                _callback(app, "convert_ui"), str(source), 0, "", False, *_translation_off(), _ticket(1), request
+            )
+            assert receipt_text is not None
+            receipt = json.loads(receipt_text)
             response = receipt["outputs"]
             run = _conversions(app).runs[request.session_hash]
             assert detail in run.snapshot and run.state.message == f"Failed: {detail}"
@@ -162,7 +191,7 @@ def test_final_error_replaces_provisional_failure(tmp_path: Path, status: str, b
             run.publish(provisional)
             assert run.state.message == f"Failed: {detail}"
         else:
-            response = await _callback(app, "convert_handler")(str(source), 0, "", False, request)
+            response = await _callback(app, "convert_handler")(str(source), 0, "", False, *_translation_off(), request)
         assert detail in response[0] and "server task" not in response[0]
         assert response[6] == ("" if browser else None)
 
@@ -215,9 +244,11 @@ def test_conversion_and_poll_are_full_non_generator_responses(tmp_path: Path) ->
     ui = next(fn for fn in app.fns.values() if fn.name == "convert_ui")
     poll = next(fn for fn in app.fns.values() if fn.name == "read_conversion_status")
     public = next(fn for fn in app.fns.values() if fn.name == "convert_handler")
-    assert all(inspect.iscoroutinefunction(fn.fn) for fn in (ui, public))
-    assert all(not inspect.isasyncgenfunction(fn.fn) for fn in (ui, public, poll))
-    assert poll.queue is False and len(public.inputs) == 4 and len(public.outputs) == 16
+    assert inspect.iscoroutinefunction(public.fn)
+    # convert_ui 按文件流式下发完整 JSON 回执，注册为异步生成器；它与轮询都不做差分缓存。
+    assert inspect.isasyncgenfunction(ui.fn)
+    assert all(not inspect.isasyncgenfunction(fn.fn) for fn in (public, poll))
+    assert poll.queue is False and len(public.inputs) == 12 and len(public.outputs) == 23
     # 模拟已上传的文件，保留 Gradio 实际输入预处理和输出序列化。
     uploaded = Path(get_upload_folder()) / tmp_path.name / source.name
     uploaded.parent.mkdir(parents=True, exist_ok=True)
@@ -233,16 +264,27 @@ def test_conversion_and_poll_are_full_non_generator_responses(tmp_path: Path) ->
             client.parse_file.side_effect = RuntimeError("controlled failure") if failed else None
             response = await app.process_api(
                 ui,
-                [file_input, index % 2, "", False, _ticket(index)],
+                [[file_input], index % 2, "", False, *_translation_off(), _ticket(index)],
                 state=session,
                 request=request,
                 session_hash="serial",
                 event_id=str(index),
             )
-            assert response["is_generating"] is False and response["iterator"] is None
+            # 异步生成器按文件逐份下发，Gradio 用 iterator 续跑到终态才结束本轮。
+            while response["is_generating"]:
+                response = await app.process_api(
+                    ui,
+                    [],
+                    state=session,
+                    request=request,
+                    iterator=response["iterator"],
+                    session_hash="serial",
+                    event_id=str(index),
+                )
+            assert response["iterator"] is None
             receipt = json.loads(response["data"][0])
             assert receipt["run_id"] == f"{index:032x}"
-            assert len(receipt["outputs"]) == 15
+            assert len(receipt["outputs"]) == 22
             status = await app.process_api(poll, [_ticket(index)], state=session, request=request, session_hash="serial")
             snapshot = json.loads(status["data"][0])
             assert snapshot["terminal"] and snapshot["sequence"] == receipt["sequence"]
@@ -252,8 +294,9 @@ def test_conversion_and_poll_are_full_non_generator_responses(tmp_path: Path) ->
                 file = receipt["outputs"][2]["value"]
                 assert file["meta"]["_type"] == "gradio.FileData"
                 assert unquote(file["url"]).endswith(file["path"]) and Path(file["path"]).is_file()
-                downloader = next(fn.fn for fn in app.fns.values() if fn.name == "handler")
-                path, download_receipt = downloader(None, json.dumps({"run_id": receipt["outputs"][6]}), request)
+                downloader = _session_downloader(app)
+                # 回执第 13 位是 active_run_id（第 6-12 位为译文预览与译文按钮）。
+                path, download_receipt = downloader(None, json.dumps({"run_id": receipt["outputs"][13]}), request)
                 assert path and not json.loads(download_receipt)["error"]
             assert not app.pending_diff_streams
 
@@ -285,7 +328,7 @@ def test_cancelled_sync_output_keeps_slot_until_thread_exits(tmp_path: Path, mon
 
     async def scenario() -> None:
         """多次取消不能使同步工作逃逸到执行槽外，也不能取消较新的任务。"""
-        first = asyncio.create_task(convert(str(source), 0, "", False, _ticket(1), request))
+        first = asyncio.create_task(_receipts(convert, str(source), 0, "", False, *_translation_off(), _ticket(1), request))
         pending: list[asyncio.Task[Any]] = [first]
         try:
             assert await asyncio.to_thread(started.wait, 3)
@@ -294,7 +337,9 @@ def test_cancelled_sync_output_keeps_slot_until_thread_exits(tmp_path: Path, mon
             pending.append(cancellation)
             await asyncio.sleep(0.01)
             assert poll(_ticket(1), request) == "" and not first.done()
-            second = asyncio.create_task(convert(str(source), 0, "", False, _ticket(2), request))
+            second = asyncio.create_task(
+                _receipts(convert, str(source), 0, "", False, *_translation_off(), _ticket(2), request)
+            )
             pending.append(second)
             await asyncio.sleep(0.01)
             assert "Queued locally" in poll(_ticket(2), request)
@@ -304,14 +349,17 @@ def test_cancelled_sync_output_keeps_slot_until_thread_exits(tmp_path: Path, mon
             await asyncio.sleep(0.01)
             assert client.parse_file.await_count == 1 and not first.done()
             release.set()
-            assert await first == ""
+            # 取消后 convert_ui 不再下发回执，drain 只返回 None。
+            assert await first is None
             await cancellation
-            result = json.loads(await second)
+            result_text = await second
+            assert result_text is not None
+            result = json.loads(result_text)
             assert result["run_id"] == f"{2:032x}" and "Completed" in result["outputs"][0]
             assert client.parse_file.await_count == 2
             # 取消先于排队提交到达时，旧提交不能重新建立状态。
             await cancel(_ticket(3), request)
-            assert await convert(str(source), 0, "", False, _ticket(3), request) == ""
+            assert await _receipts(convert, str(source), 0, "", False, *_translation_off(), _ticket(3), request) is None
             assert client.parse_file.await_count == 2
         finally:
             release.set()

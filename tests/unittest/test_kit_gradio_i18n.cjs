@@ -18,21 +18,22 @@ for (const [languages, language, expected] of [
     const range = vm.runInContext(resource("gradio_page_range.js"), context);
     const out = range(["flash", "standard"], ["csv"], 20, "/test.pdf", 1,
         JSON.stringify({ path: "/test.pdf", page_count: 10 }), "{}", 1, 1,
+        1, 1,
         JSON.stringify({ tier: "standard", locked: false }));
     assert.equal(out[0].label, i18n.text("start_page"));
-    assert.equal(out[3], "1-10");
-    assert.ok(out[2].includes(i18n.text("page_limit", { count: 20 })));
-    assert.equal(out[8], i18n.text("tier_value", { tier: i18n.text("tier_standard"), notice: "" }));
-    assert.ok(!out[2].includes("<strong>"));
-    assert.ok(!out[2].includes(i18n.text("start_page")));
-    assert.ok(!out[2].includes(i18n.text("end_page")));
+    assert.equal(out[5], "1-10");
+    assert.ok(out[4].includes(i18n.text("page_limit", { count: 20 })));
+    assert.equal(out[10], i18n.text("tier_value", { tier: i18n.text("tier_standard"), notice: "" }));
+    assert.ok(!out[4].includes("<strong>"));
+    assert.ok(!out[4].includes(i18n.text("start_page")));
+    assert.ok(!out[4].includes(i18n.text("end_page")));
     for (const [position, tier] of ["flash", "basic", "standard", "advanced"].entries()) {
         const labels = expected === "zh"
             ? ["解析等级：flash（极速）", "解析等级：basic（中）", "解析等级：standard（高）", "解析等级：advanced（极高）"]
             : ["Parsing tier: flash", "Parsing tier: basic (medium)", "Parsing tier: standard (high)", "Parsing tier: advanced (xhigh)"];
         const result = range(["flash", "basic", "standard", "advanced"], ["csv"], null, null, position,
-            "{}", "{}", 1, 1, JSON.stringify({ tier, locked: false }));
-        assert.equal(result[8], labels[position]);
+            "{}", "{}", 1, 1, 1, 1, JSON.stringify({ tier, locked: false }));
+        assert.equal(result[10], labels[position]);
     }
     const download = vm.runInContext(resource("gradio_download.js"), context);
     const formats = [["html", "HTML"]];

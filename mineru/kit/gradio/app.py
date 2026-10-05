@@ -8,9 +8,9 @@ import json
 import os
 import time
 import uuid
+from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
 from pathlib import Path
-from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -29,7 +29,26 @@ from ...filetypes import (
 from ...types import TIERS, Tier
 from ...utils.logger import configure_global_log_level
 from ...utils.stdio import configure_standard_streams
-from .artifacts import RunArtifacts, persist_parse_result, render_download, render_html_preview
+from .artifacts import (
+    RunArtifacts,
+    _ensure_path_inside,
+    persist_parse_result,
+    render_download,
+    render_html_preview,
+    render_translation_download,
+)
+from .translation import (
+    DEFAULT_PROVIDER,
+    DEFAULT_SOURCE_LANGUAGE,
+    DEFAULT_TARGET_LANGUAGE,
+    LANGUAGES,
+    PROVIDERS,
+    render_translation_html,
+    test_translation_connection,
+    TranslationConfig,
+    TranslationError,
+    translate_markdown,
+)
 from .client import (
     GradioArtifactClient,
     ManagedLocalApiServer,
@@ -62,6 +81,15 @@ _DOWNLOAD_FORMATS: tuple[tuple[str, str], ...] = (
     ("epub", "EPUB"),
     ("pdf", "PDF"),
 )
+# 译文下载格式：key 为格式标识，value 为 i18n 文案键（后缀）。
+# 译文不含 html/epub：这两种格式无法仅从 Markdown 经现有渲染器生成。
+_TRANSLATION_DOWNLOAD_FORMATS: tuple[tuple[str, str], ...] = (
+    ("markdown", "translate_download"),
+    ("json", "translate_download_json"),
+    ("docx", "translate_download_docx"),
+    ("latex", "translate_download_latex"),
+    ("pdf", "translate_download_pdf"),
+)
 # 下载图标采用统一线宽：Markdown 标记、JSON 花括号、HTML 标签、文档、公式、书籍和 PDF 文件。
 _DOWNLOAD_ICON_PATHS: dict[str, str] = {
     "markdown": "M3 17V7l4 5 4-5v10M15 13l3 4 3-4M18 7v10",
@@ -73,7 +101,49 @@ _DOWNLOAD_ICON_PATHS: dict[str, str] = {
     "epub": "M12 6c-3-2-6-2-10-2v15c4 0 7 0 10 2 3-2 6-2 10-2V4c-4 0-7 0-10 2v15",
     "pdf": "M14 3H5v18h14V8l-5-5v5h5M8 17c3-4 5-8 4-8-2 0-1 7 4 7 3 0-5-3-8 1-1 2 1 1 2 0",
 }
-_DEFAULT_TIER = "standard"
+# 连接状态徽章：图标 + 短文案，避免长段落提示；详细原因放在 title 悬浮提示中。
+_TRANSLATE_TEST_ICONS: dict[str, str] = {
+    # 蓝色对号：连接成功。
+    "success": '<circle cx="12" cy="12" r="10" /><path d="m8 12 3 3 5-6" />',
+    # 绿色断链：尚未测试。
+    "idle": (
+        '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.5 1.5" />'
+        '<path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.5-1.5" />'
+    ),
+    # 蓝色叉号：连接失败。
+    "failed": '<circle cx="12" cy="12" r="10" /><path d="m15 9-6 6M9 9l6 6" />',
+    # 灰色旋转箭头：测试进行中。
+    "pending": '<path d="M21 12a9 9 0 1 1-6.2-8.56" />',
+}
+_TRANSLATE_TEST_COLORS: dict[str, str] = {
+    "success": "#0969da",
+    "idle": "#1a7f37",
+    "failed": "#0969da",
+    "pending": "#57606a",
+}
+_TRANSLATE_TEST_KEYS: dict[str, str] = {
+    "success": "translate_test_success",
+    "idle": "translate_test_idle",
+    "failed": "translate_test_failed_short",
+    "pending": "translate_testing",
+}
+
+
+def translation_test_badge(state: str, tooltip: str = "") -> str:
+    """生成紧凑的连接状态徽章；tooltip 为悬浮显示的完整错误详情（纯文本）。"""
+    color = _TRANSLATE_TEST_COLORS[state]
+    title_attr = f' title="{html.escape(tooltip, quote=True)}"' if tooltip else ""
+    spin = " mineru-translate-spin" if state == "pending" else ""
+    return (
+        f'<span class="mineru-translate-badge{spin}"{title_attr}>'
+        f'<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="{color}" stroke-width="2"'
+        ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'
+        f"{_TRANSLATE_TEST_ICONS[state]}</svg>"
+        f"{localized_text(_TRANSLATE_TEST_KEYS[state])}</span>"
+    )
+
+
+_DEFAULT_TIER = "basic"
 _DOWNLOAD_ICON_HTML = f"""
 <button type="button" class="mineru-kit-download-icon" title="Download results" aria-label="Download results"
         data-mineru-i18n-key="download_results" data-mineru-i18n-attr="title aria-label"
@@ -252,6 +322,17 @@ _KIT_MENU_CSS = """
     min-height: var(--mineru-preview-content-height, 775px) !important;
   }
 }
+/* 连接测试徽章：紧凑内联，随按钮同行显示。 */
+.mineru-translate-test-status { min-height: 0 !important; }
+.mineru-translate-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 13px; line-height: 1; white-space: nowrap;
+}
+@keyframes mineru-translate-spin { to { transform: rotate(360deg); } }
+.mineru-translate-badge.mineru-translate-spin svg {
+  animation: mineru-translate-spin 0.9s linear infinite;
+  transform-origin: center;
+}
 """
 
 
@@ -261,17 +342,29 @@ def _resource_text(resource_name: str) -> str:
     return resource_path.read_text(encoding="utf-8")
 
 
+def _format_icon_svg(path: str) -> str:
+    """把单条 SVG 路径包装为统一线宽的 data URI 可嵌入字符串。"""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
+        f'stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="{path}"/></svg>'
+    )
+    return quote(svg)
+
+
 def _download_icon_css() -> str:
-    """为各下载格式生成本地 SVG 遮罩，随按钮文字适配主题且不改变无障碍名称。"""
+    """为原文与译文各下载格式生成本地 SVG 遮罩，随按钮文字适配主题且不改变无障碍名称。
+
+    译文按钮复用同名格式图标，但使用独立 class 前缀，避免与原文按钮选择器混淆。
+    """
     rules = []
     for format_name, path in _DOWNLOAD_ICON_PATHS.items():
-        svg = (
-            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" '
-            f'stroke="black" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="{path}"/></svg>'
-        )
-        rules.append(
-            f'.mineru-kit-download-{format_name} {{ --mineru-download-format-icon: url("data:image/svg+xml,{quote(svg)}"); }}'
-        )
+        svg_uri = _format_icon_svg(path)
+        selector = f".mineru-kit-download-{format_name}"
+        rules.append(f'{selector} {{ --mineru-download-format-icon: url("data:image/svg+xml,{svg_uri}"); }}')
+    for format_name, _label_key in _TRANSLATION_DOWNLOAD_FORMATS:
+        svg_uri = _format_icon_svg(_DOWNLOAD_ICON_PATHS[format_name])
+        selector = f".mineru-kit-translation-download-{format_name}"
+        rules.append(f'{selector} {{ --mineru-download-format-icon: url("data:image/svg+xml,{svg_uri}"); }}')
     return "\n".join(rules)
 
 
@@ -310,10 +403,10 @@ def _supported_file_types() -> list[str]:
 
 
 def _default_tier(capabilities: V1ServerCapabilities) -> str:
-    """按服务能力选择默认 tier，优先保持 Standard 语义。"""
+    """按服务能力选择默认 tier，默认 basic（中），不支持时按质量就近回退。"""
     if _DEFAULT_TIER in capabilities.tiers:
         return _DEFAULT_TIER
-    for tier in ("advanced", "standard", "basic", "flash"):
+    for tier in ("standard", "advanced", "flash"):
         if tier in capabilities.tiers:
             return tier
     return capabilities.tiers[0]
@@ -357,6 +450,11 @@ def _pdf_preview_update(gr: Any, value: str | None) -> Any:
 def _download_updates(gr: Any, *, interactive: bool, run_id: str = "") -> tuple[Any, ...]:
     """同步当前结果标识，并恢复全部下载按钮的标签与交互状态。"""
     return (run_id, *(gr.update(value=label, interactive=interactive) for _format_name, label in _DOWNLOAD_FORMATS))
+
+
+def _translation_download_updates(gr: Any, *, interactive: bool, visible: bool = False) -> tuple[Any, ...]:
+    """统一设置 5 个译文格式按钮的可见性与交互状态；多语言文案在创建时已绑定，不改 value。"""
+    return tuple(gr.update(visible=visible, interactive=interactive) for _ in _TRANSLATION_DOWNLOAD_FORMATS)
 
 
 def build_gradio_app(
@@ -406,7 +504,7 @@ def build_gradio_app(
                 input_file = gr.File(
                     label=i18n("mineru.upload"),
                     file_types=file_types,
-                    file_count="single",
+                    file_count="multiple",
                     type="filepath",
                     elem_classes=["mineru-upload-file"],
                 )
@@ -449,31 +547,119 @@ def build_gradio_app(
                 # 通过子 HTML 的明确状态控制显隐，保留原生滑块的交互状态。
                 with gr.Column(min_width=0, elem_classes=["mineru-kit-page-range"]):
                     page_summary = gr.HTML(value="", elem_classes=["mineru-page-summary"])
-                    with gr.Row(elem_classes=["mineru-page-sliders"]):
-                        page_handle_a = gr.Slider(
+                    # 一行布局：小的起止页输入框分居双滑块轨道两侧。
+                    with gr.Row(elem_classes=["mineru-page-range-row"]):
+                        page_input_a = gr.Number(
                             minimum=1,
-                            # 新版 Gradio 拒绝零跨度，单页与空状态仍保持禁用和值为 1。
                             maximum=2,
                             value=1,
-                            step=1,
                             precision=0,
                             label=i18n("mineru.start_page"),
+                            show_label=False,
                             interactive=False,
                             container=False,
-                            elem_classes=["mineru-page-handle-a"],
+                            scale=1,
+                            min_width=0,
+                            elem_classes=["mineru-page-input-a"],
                         )
-                        page_handle_b = gr.Slider(
+                        with gr.Column(
+                            min_width=0,
+                            scale=12,
+                            elem_classes=["mineru-page-sliders"],
+                        ):
+                            page_handle_a = gr.Slider(
+                                minimum=1,
+                                # 新版 Gradio 拒绝零跨度，单页与空状态仍保持禁用和值为 1。
+                                maximum=2,
+                                value=1,
+                                step=1,
+                                precision=0,
+                                label=i18n("mineru.start_page"),
+                                interactive=False,
+                                container=False,
+                                elem_classes=["mineru-page-handle-a"],
+                            )
+                            page_handle_b = gr.Slider(
+                                minimum=1,
+                                maximum=2,
+                                value=1,
+                                step=1,
+                                precision=0,
+                                label=i18n("mineru.end_page"),
+                                interactive=False,
+                                container=False,
+                                elem_classes=["mineru-page-handle-b"],
+                            )
+                        page_input_b = gr.Number(
                             minimum=1,
                             maximum=2,
                             value=1,
-                            step=1,
                             precision=0,
                             label=i18n("mineru.end_page"),
+                            show_label=False,
                             interactive=False,
                             container=False,
-                            elem_classes=["mineru-page-handle-b"],
+                            scale=1,
+                            min_width=0,
+                            elem_classes=["mineru-page-input-b"],
                         )
                 page_notice = gr.HTML(value="", visible=False, elem_classes=["mineru-page-notice"])
+                translate_enabled = gr.Checkbox(
+                    label=i18n("mineru.translate_enable"),
+                    info=i18n("mineru.translate_enable_info"),
+                    value=False,
+                    elem_classes=["mineru-translate-enable"],
+                )
+                with gr.Group(visible=False, elem_classes=["mineru-translate-settings"]) as translate_group:
+                    with gr.Row():
+                        translate_source = gr.Dropdown(
+                            label=i18n("mineru.translate_source"),
+                            choices=list(LANGUAGES.keys()),
+                            value=DEFAULT_SOURCE_LANGUAGE,
+                            min_width=0,
+                        )
+                        translate_target = gr.Dropdown(
+                            label=i18n("mineru.translate_target"),
+                            choices=[name for name in LANGUAGES if name != "自动检测"],
+                            value=DEFAULT_TARGET_LANGUAGE,
+                            min_width=0,
+                        )
+                    translate_provider = gr.Dropdown(
+                        label=i18n("mineru.translate_provider"),
+                        choices=list(PROVIDERS.keys()),
+                        value=DEFAULT_PROVIDER,
+                    )
+                    translate_base_url = gr.Textbox(
+                        label=i18n("mineru.translate_base_url"),
+                        value=PROVIDERS[DEFAULT_PROVIDER].base_url,
+                    )
+                    translate_model = gr.Textbox(
+                        label=i18n("mineru.translate_model"),
+                        value=PROVIDERS[DEFAULT_PROVIDER].model,
+                    )
+                    translate_api_key = gr.Textbox(
+                        label=i18n("mineru.translate_api_key"),
+                        info=i18n("mineru.translate_api_key_info"),
+                        value=PROVIDERS[DEFAULT_PROVIDER].api_key,
+                        type="password",
+                    )
+                    translate_concurrency = gr.Slider(
+                        label=i18n("mineru.translate_concurrency"),
+                        minimum=1,
+                        maximum=16,
+                        step=1,
+                        value=1,
+                    )
+                    with gr.Row():
+                        translate_test_button = gr.Button(
+                            i18n("mineru.translate_test"),
+                            scale=1,
+                            min_width=0,
+                        )
+                        translate_test_status = gr.HTML(
+                            value=translation_test_badge("idle"),
+                            elem_classes=["mineru-translate-test-status"],
+                        )
                 with gr.Row(elem_classes=["mineru-actions"]):
                     convert_button = gr.Button(
                         i18n("mineru.convert"),
@@ -552,6 +738,11 @@ def build_gradio_app(
                             buttons=["copy"],
                             elem_classes=["mineru-structured-json"],
                         )
+                    with gr.Tab(i18n("mineru.translate_tab"), visible=False) as translate_tab:
+                        translate_output = gr.HTML(
+                            value="",
+                            elem_classes=["mineru-markdown-output", "mineru-translation-output"],
+                        )
                 with gr.Column(scale=0, min_width=0, elem_classes=["mineru-kit-download-menu"]):
                     gr.HTML(_DOWNLOAD_ICON_HTML, elem_classes=["mineru-kit-download-trigger"])
                     with gr.Column(
@@ -569,6 +760,16 @@ def build_gradio_app(
                                 min_width=0,
                                 elem_classes=[f"mineru-kit-download-{format_name}"],
                             )
+                        translate_download_buttons: dict[str, Any] = {}
+                        for format_name, label_key in _TRANSLATION_DOWNLOAD_FORMATS:
+                            translate_download_buttons[format_name] = gr.Button(
+                                i18n(f"mineru.{label_key}"),
+                                visible=False,
+                                interactive=False,
+                                size="sm",
+                                min_width=0,
+                                elem_classes=[f"mineru-kit-translation-download-{format_name}"],
+                            )
                 download_notice = gr.HTML(value="", elem_classes=["mineru-kit-download-notice"])
 
         artifact_state = gr.State(value=None)
@@ -578,15 +779,25 @@ def build_gradio_app(
         conversion_cancel = gr.Textbox(value="", visible=False)
         status_snapshot = gr.Textbox(value="", visible=False)
         status_poll = gr.Timer(value=1.0, active=False)
+        # 记录连接测试通过时的配置指纹；配置一旦变更即失效，转换前必须重新测试。
+        translate_test_pass = gr.State(value="")
         api_conversion_button = gr.Button(visible=False)
         download_files = {name: gr.File(visible=False, interactive=False) for name, _label in _DOWNLOAD_FORMATS}
         download_requests = {name: gr.Textbox(value="", visible=False) for name, _label in _DOWNLOAD_FORMATS}
         download_receipts = {name: gr.Textbox(value="", visible=False) for name, _label in _DOWNLOAD_FORMATS}
+        translate_download_files = {
+            name: gr.File(visible=False, interactive=False) for name, _key in _TRANSLATION_DOWNLOAD_FORMATS
+        }
+        translate_download_requests = {
+            name: gr.Textbox(value="", visible=False) for name, _key in _TRANSLATION_DOWNLOAD_FORMATS
+        }
         clear_button.add(
             [
                 input_file,
                 page_range,
                 force_ocr,
+                translate_enabled,
+                translate_output,
                 html_output,
                 json_output,
                 pdf_preview,
@@ -597,8 +808,9 @@ def build_gradio_app(
             ]
         )
 
-        def update_file_preview(file_path: str | None, request: object | None = None) -> tuple[Any, ...]:
-            """切换源文件预览，并清除上一份文档的结果与下载状态。"""
+        def update_file_preview(file_paths: list[str] | str | None, request: object | None = None) -> tuple[Any, ...]:
+            """切换源文件预览（多文件时预览第一个），并清除上一份文档的结果与下载状态。"""
+            file_path = file_paths[0] if isinstance(file_paths, list) else file_paths
             reset_result = (_status_html(_DEFAULT_STATUS), "", None, *_download_updates(gr, interactive=False), "")
             if not file_path:
                 return (
@@ -658,6 +870,107 @@ def build_gradio_app(
         update_file_preview.__annotations__["request"] = gr.Request
         private_event_kwargs = {"queue": False, "api_visibility": "private"}
 
+        def toggle_translation_settings(enabled: bool) -> Any:
+            """勾选全文翻译后展开语言与模型设置。"""
+            return gr.update(visible=enabled)
+
+        translate_enabled.change(
+            fn=toggle_translation_settings,
+            inputs=translate_enabled,
+            outputs=translate_group,
+            **private_event_kwargs,
+        )
+
+        def apply_translation_preset(provider_name: str) -> tuple[Any, Any, Any]:
+            """切换服务商预设时回填接口地址、模型与示例密钥；用户仍可继续手动修改。"""
+            preset = PROVIDERS[provider_name]
+            return (
+                gr.update(value=preset.base_url),
+                gr.update(value=preset.model),
+                gr.update(value=preset.api_key),
+            )
+
+        translate_provider.change(
+            fn=apply_translation_preset,
+            inputs=translate_provider,
+            outputs=[translate_base_url, translate_model, translate_api_key],
+            **private_event_kwargs,
+        )
+
+        def translation_fingerprint(
+            source: str,
+            target: str,
+            base_url: str,
+            model: str,
+            api_key: str,
+        ) -> str:
+            """影响连接可用性的配置构成指纹；并发数不影响连接，故不计入。"""
+            return json.dumps([source, target, base_url.strip(), model.strip(), api_key.strip()], ensure_ascii=False)
+
+        def run_translation_test(
+            source: str,
+            target: str,
+            base_url: str,
+            model: str,
+            api_key: str,
+        ) -> tuple[str, str]:
+            """执行一次连接测试，返回（状态 HTML, 通过时的配置指纹）；失败时指纹置空。"""
+            config = TranslationConfig(
+                source_language=LANGUAGES[source],
+                target_language=LANGUAGES[target],
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+            )
+            # 徽章只展示图标和短文案，完整错误原因通过悬浮 title 查看。
+            try:
+                test_translation_connection(config)
+            except TranslationError as exc:
+                return (
+                    translation_test_badge("failed", str(exc)),
+                    "",
+                )
+            return (
+                translation_test_badge("success"),
+                translation_fingerprint(source, target, base_url, model, api_key),
+            )
+
+        def translation_test_pending() -> str:
+            """点击后立即给出旋转反馈，避免网络等待期间界面无反馈。"""
+            return translation_test_badge("pending")
+
+        # 先显示"正在测试"，再链式执行真实连接测试并覆盖为成功/失败结果。
+        translate_test_button.click(
+            fn=translation_test_pending,
+            inputs=[],
+            outputs=[translate_test_status],
+            **private_event_kwargs,
+        ).then(
+            fn=run_translation_test,
+            inputs=[translate_source, translate_target, translate_base_url, translate_model, translate_api_key],
+            outputs=[translate_test_status, translate_test_pass],
+            **private_event_kwargs,
+        )
+
+        def reset_translation_test() -> tuple[str, str]:
+            """连接相关配置变更后，上次测试结果立即失效，恢复为未测试徽章。"""
+            return translation_test_badge("idle"), ""
+
+        # 任一影响连接的配置变更都撤销测试通过状态，防止拿旧结果发起转换。
+        for control in (
+            translate_source,
+            translate_target,
+            translate_base_url,
+            translate_model,
+            translate_api_key,
+        ):
+            control.change(
+                fn=reset_translation_test,
+                inputs=[],
+                outputs=[translate_test_status, translate_test_pass],
+                **private_event_kwargs,
+            )
+
         # 换文件和清除先在浏览器中撤销旧预览，文件输出仍由原有 Python 事件管理。
         input_file.change(fn=None, inputs=input_file, outputs=pdf_viewer, js=pdf_preview_js("reset"), **private_event_kwargs)
         clear_button.click(fn=None, inputs=[], outputs=pdf_viewer, js=pdf_preview_js("clear"), **private_event_kwargs)
@@ -701,11 +1014,29 @@ def build_gradio_app(
             arguments = ", ".join(json.dumps(value) for value in (action, _DOWNLOAD_FORMATS, format_name, label))
             return f"(...args) => ({download_script})({arguments}, ...args)"
 
+        def download_reset_js() -> str:
+            """通用 reset 只清空原文下载控件；在回执与按钮之间补入译文相关重置，使输出与 download_reset_outputs 对齐。"""
+            offset = 1 + len(_DOWNLOAD_FORMATS) * 3
+            return (
+                "(...args) => { "
+                f"const reset = ({download_js('reset')})(...args); "
+                f"const offset = {offset}; "
+                # 译文：清空预览、隐藏 Tab、重置 5 个译文按钮。
+                "const translationReset = ['', {__type__: 'update', visible: false}, "
+                f"...Array({len(_TRANSLATION_DOWNLOAD_FORMATS)}).fill("
+                # 非 f-string 中花号无需转义，写成 {{ 会生成 JS 非法的 { { 导致页面白屏。
+                "{__type__: 'update', visible: false, interactive: false})]; "
+                "return [...reset.slice(0, offset), ...translationReset, ...reset.slice(offset)]; }"
+            )
+
         download_reset_outputs = [
             active_run_id,
             *download_files.values(),
             *download_requests.values(),
             *download_receipts.values(),
+            translate_output,
+            translate_tab,
+            *translate_download_buttons.values(),
             *download_buttons.values(),
             download_notice,
         ]
@@ -718,13 +1049,14 @@ def build_gradio_app(
             fn=None,
             inputs=[],
             outputs=download_reset_outputs,
-            js=download_js("reset"),
+            js=download_reset_js(),
             **private_event_kwargs,
         )
         active_run_id.change(fn=None, inputs=active_run_id, outputs=[], js=download_js("activate"), **private_event_kwargs)
 
-        def update_ocr_control(file_path: str | None) -> Any:
-            """仅为原始 PDF 显示开关，并在更换或清除文件时重置为自动判断。"""
+        def update_ocr_control(file_paths: list[str] | str | None) -> Any:
+            """仅为原始 PDF 显示开关，多文件时以第一个为准，更换或清除时重置为自动判断。"""
+            file_path = file_paths[0] if isinstance(file_paths, list) else file_paths
             return gr.update(value=False, visible=_file_suffix(file_path) in PDF_EXTENSIONS)
 
         input_file.change(
@@ -760,10 +1092,22 @@ def build_gradio_app(
         ]
 
         # 文件页数只在上传后读取；前端缓存元数据，tier 切换和拖动不发起 Python 请求。
-        range_inputs = [input_file, tier, page_metadata, page_selection, page_handle_a, page_handle_b, tier_selection]
+        range_inputs = [
+            input_file,
+            tier,
+            page_metadata,
+            page_selection,
+            page_handle_a,
+            page_handle_b,
+            page_input_a,
+            page_input_b,
+            tier_selection,
+        ]
         range_outputs = [
             page_handle_a,
             page_handle_b,
+            page_input_a,
+            page_input_b,
             page_summary,
             page_range,
             page_selection,
@@ -774,9 +1118,17 @@ def build_gradio_app(
             tier_selection,
         ]
         range_script = _resource_text("gradio_page_range.js")
-        # 共用一个 always_last 事件流，避免文件、元数据、清除与拖动的并行回调互相覆盖。
+        # 共用一个 always_last 事件流，避免文件、元数据、清除、拖动与手动输入的并行回调互相覆盖。
         gr.on(
-            triggers=[input_file.change, tier.input, page_metadata.change, page_handle_a.input, page_handle_b.input],
+            triggers=[
+                input_file.change,
+                tier.input,
+                page_metadata.change,
+                page_handle_a.input,
+                page_handle_b.input,
+                page_input_a.input,
+                page_input_b.input,
+            ],
             fn=None,
             inputs=range_inputs,
             outputs=range_outputs,
@@ -788,8 +1140,9 @@ def build_gradio_app(
             **private_event_kwargs,
         )
 
-        def read_page_metadata(file_path: str | None) -> str:
-            """把页数元数据编码为稳定的 JSON 文本，供两个 Gradio 主版本共用。"""
+        def read_page_metadata(file_paths: list[str] | str | None) -> str:
+            """把首个文件的页数元数据编码为稳定的 JSON 文本，供两个 Gradio 主版本共用。"""
+            file_path = file_paths[0] if isinstance(file_paths, list) else file_paths
             return json.dumps(pdf_page_metadata(file_path), ensure_ascii=False)
 
         input_file.change(
@@ -807,14 +1160,36 @@ def build_gradio_app(
             tier_position: int | float,
             raw_page_range: str,
             force_ocr: bool,
+            translation_enabled: bool,
+            translation_source: str,
+            translation_target: str,
+            translation_base_url: str,
+            translation_model: str,
+            translation_api_key: str,
+            translation_concurrency: int | float,
+            passed_fingerprint: str,
             request: object | None,
+            file_index: int = 1,
+            total_files: int = 1,
         ) -> tuple[Any, ...]:
-            """执行一次转换，只返回完整终态；进度写入独立的会话快照。"""
+            """执行单文件的解析（可选全文翻译），只返回完整终态；进度写入独立的会话快照。
+
+            翻译参数仅在 translation_enabled 为真时生效；启用翻译前要求
+            passed_fingerprint 与当前翻译配置指纹一致（即连接测试已通过且配置未改动），
+            否则拒绝执行，防止用户改过配置却沿用旧测试结果。
+            """
+            # 进入本文件：解锁上一文件的终态，允许其成功/失败通知重新计数。
+            run.begin_file()
+            if total_files > 1:
+                run.publish(f"Processing file ({file_index}/{total_files})")
             reset_result = (
                 _status_html(_DEFAULT_STATUS),
                 "",
                 *(gr.skip() for _ in range(4)),
                 None,
+                "",
+                gr.update(visible=False),
+                *_translation_download_updates(gr, interactive=False, visible=False),
                 *_download_updates(gr, interactive=False),
                 "",
             )
@@ -832,6 +1207,17 @@ def build_gradio_app(
             suffix = _file_suffix(source_path)
             if suffix not in PARSEABLE_EXTENSIONS:
                 return failure(f"unsupported file type '.{suffix}'")
+            if translation_enabled:
+                # 勾选翻译时必须已对当前配置测试通过；指纹不匹配则在解析前拦截。
+                expected_fingerprint = translation_fingerprint(
+                    translation_source,
+                    translation_target,
+                    translation_base_url,
+                    translation_model,
+                    translation_api_key,
+                )
+                if passed_fingerprint != expected_fingerprint:
+                    return failure(localized_text("translate_test_required"))
             try:
                 selected_tier = _tier_for_position(tier_position, tier_choices)
             except ValueError as exc:
@@ -883,6 +1269,56 @@ def build_gradio_app(
                     )
                     if _is_office(source_path) or suffix in {"ofd", "epub"} or suffix in HTML_EXTENSIONS | MHTML_EXTENSIONS:
                         result_preview_updates = tuple(gr.skip() for _ in range(4))
+                    if translation_enabled:
+                        # 翻译参数全部来自界面控件；语言名下拉 key 需换成模型侧规范名称。
+                        translation_config = TranslationConfig(
+                            source_language=LANGUAGES[translation_source],
+                            target_language=LANGUAGES[translation_target],
+                            base_url=translation_base_url.strip(),
+                            model=translation_model.strip(),
+                            api_key=translation_api_key.strip(),
+                            concurrency=max(1, int(translation_concurrency)),
+                        )
+                        # 翻译源使用 FULL 模式 Markdown（含 "\n\n---\n\n" 页分隔符），
+                        # 而非面向下载的 DEFAULT markdown.md，保证逐页切分不失效。
+                        markdown_text = await run_sync_output(artifacts.translation_markdown_path.read_text, encoding="utf-8")
+
+                        def report_translation(done: int, total: int) -> None:
+                            """翻译在工作线程推进，经 emit 线程安全地把页级进度写回状态卡片。
+
+                            这里只发送纯文本协议消息，由状态卡片的 localized_message
+                            统一渲染；直接发 localized_text 的 HTML 会被二次转义成可见标签源码。
+                            """
+                            emit(f"Translating... ({done}/{total})")
+
+                        translated_markdown = await run_sync_output(
+                            translate_markdown, markdown_text, translation_config, progress_callback=report_translation
+                        )
+                        translation_path = artifacts.root / f"{artifacts.stem}_translation.md"
+                        translation_path.write_text(translated_markdown, encoding="utf-8")
+                        artifacts.translation_path = translation_path
+                        # 译文图片沿用原文图片目录，故以 artifact 目录作为相对链接基准。
+                        asset_base_url = (
+                            f"{_gradio_public_base_url(request).rstrip('/')}"
+                            f"/gradio_api/file={quote(artifacts.root.as_posix(), safe='/:')}"
+                        )
+                        translated_html = await run_sync_output(
+                            render_translation_html, translated_markdown, asset_base_url=asset_base_url
+                        )
+                        # 译文 HTML 不含脚本，沙箱仅放行链接的新标签打开。
+                        translation_updates = (
+                            '<iframe class="mineru-rendered-html-frame" title="Translation preview" '
+                            'sandbox="allow-popups allow-popups-to-escape-sandbox" '
+                            f'srcdoc="{html.escape(translated_html, quote=True)}"></iframe>',
+                            gr.update(visible=True),
+                            *_translation_download_updates(gr, interactive=True, visible=True),
+                        )
+                    else:
+                        translation_updates = (
+                            "",
+                            gr.update(visible=False),
+                            *_translation_download_updates(gr, interactive=False, visible=False),
+                        )
                     run.artifacts = artifacts.as_state()
                     logger.debug(
                         "WebUI output ready run_id={} artifacts={} elapsed={:.3f}s html_bytes={} json_bytes={} ready_at={:.3f}",
@@ -897,6 +1333,7 @@ def build_gradio_app(
                         rendered_html,
                         *result_preview_updates,
                         run.artifacts,
+                        *translation_updates,
                         *_download_updates(gr, interactive=True, run_id=artifacts.root.name),
                         structured_json,
                     )
@@ -907,7 +1344,9 @@ def build_gradio_app(
                 result_outputs = await asyncio.shield(task)
                 if run.cancelled:
                     return tuple(gr.skip() for _ in reset_result)
-                run.publish(STATUS_COMPLETED)
+                # 只有最后一个文件才发布 Completed 终态；中间文件保留其结果即进入下一个。
+                if file_index >= total_files:
+                    run.publish(STATUS_COMPLETED)
                 return (run.state.render(), *result_outputs)
             except asyncio.CancelledError:
                 run.cancel()
@@ -922,18 +1361,49 @@ def build_gradio_app(
                 run.task = None
 
         async def convert_handler(
-            file_path: str | None,
+            file_paths: list[str] | str | None,
             tier_position: int | float,
             raw_page_range: str,
             force_ocr: bool = False,
+            translation_enabled: bool = False,
+            translation_source: str = DEFAULT_SOURCE_LANGUAGE,
+            translation_target: str = DEFAULT_TARGET_LANGUAGE,
+            translation_base_url: str = "",
+            translation_model: str = "",
+            translation_api_key: str = "",
+            translation_concurrency: int | float = 1,
+            passed_fingerprint: str = "",
             request: object | None = None,
         ) -> tuple[Any, ...]:
-            """保留公开转换 API 的四个输入和原生组件输出，普通响应一次返回结果。"""
+            """公开转换 API 的输入与原生组件输出，普通响应一次返回首个文件结果。
+
+            形参顺序与下方 convert 事件绑定的 Gradio inputs 严格一一对应（顺序敏感，
+            调整组件时必须同步修改签名与相关测试）：
+            文件 → 档位位置 → 页码范围 → 强制 OCR → 翻译开关 → 源语言 → 目标语言
+            → Base URL → 模型 → API Key → 翻译并发 → 连接测试指纹 → 请求对象。
+            """
+            # 上传组件支持多选；公开 API 保持单文件语义，只处理列表中的第一个文件。
+            file_path = file_paths[0] if isinstance(file_paths, list) else file_paths
             session = getattr(request, "session_hash", None) or uuid.uuid4().hex
             run = conversions.start(session, uuid.uuid4().hex)
             assert run is not None
             try:
-                return await execute_conversion(run, file_path, tier_position, raw_page_range, force_ocr, request)
+                return await execute_conversion(
+                    run,
+                    file_path,
+                    tier_position,
+                    raw_page_range,
+                    force_ocr,
+                    translation_enabled,
+                    translation_source,
+                    translation_target,
+                    translation_base_url,
+                    translation_model,
+                    translation_api_key,
+                    translation_concurrency,
+                    passed_fingerprint,
+                    request,
+                )
             finally:
                 conversions.cancel(session, run.run_id)
 
@@ -945,6 +1415,9 @@ def build_gradio_app(
             office_preview,
             generic_preview,
             artifact_state,
+            translate_output,
+            translate_tab,
+            *translate_download_buttons.values(),
             active_run_id,
             *download_buttons.values(),
             json_output,
@@ -960,7 +1433,20 @@ def build_gradio_app(
         # 公开 API 仍由 Gradio 原生组件序列化，浏览器通过私有回执校验后才应用结果。
         convert_event = api_conversion_button.click(
             fn=convert_handler,
-            inputs=[input_file, tier, page_range, force_ocr],
+            inputs=[
+                input_file,
+                tier,
+                page_range,
+                force_ocr,
+                translate_enabled,
+                translate_source,
+                translate_target,
+                translate_base_url,
+                translate_model,
+                translate_api_key,
+                translate_concurrency,
+                translate_test_pass,
+            ],
             outputs=convert_outputs,
             **event_kwargs,
         )
@@ -1003,14 +1489,22 @@ def build_gradio_app(
             conversions.revisions.pop(getattr(request, "session_hash", "") or "", None)
 
         async def convert_ui(
-            file_path: str | None,
+            file_paths: list[str] | str | None,
             tier_position: int | float,
             raw_page_range: str,
             force_ocr: bool,
+            translation_enabled: bool,
+            translation_source: str,
+            translation_target: str,
+            translation_base_url: str,
+            translation_model: str,
+            translation_api_key: str,
+            translation_concurrency: int | float,
+            passed_fingerprint: str,
             ticket: str,
             request: object | None = None,
-        ) -> str:
-            """用完整回执传递浏览器结果，使迟到响应无法直接覆盖可见组件。"""
+        ) -> AsyncGenerator[str, None]:
+            """逐个文件转换并逐份下发回执，使界面随每个文件刷新、且全部产物落盘。"""
             from gradio.data_classes import FileData
 
             try:
@@ -1018,37 +1512,68 @@ def build_gradio_app(
                 run_id = uuid.UUID(identity["run_id"]).hex
                 revision = identity["revision"]
                 if type(revision) is not int or revision <= 0:
-                    return ""
+                    return
             except (ValueError, TypeError, KeyError, AttributeError):
-                return ""
+                return
+            # Gradio 多文件组件传路径列表；兼容单值输入。
+            paths: list[str | None] = list(file_paths) if isinstance(file_paths, list) else [file_paths]
             session = getattr(request, "session_hash", "") or ""
             run = conversions.start(session, run_id, revision=revision)
             if run is None:
-                return ""
-            result = await execute_conversion(run, file_path, tier_position, raw_page_range, force_ocr, request)
-            if conversions.current(session, run_id) is not run:
-                return ""
-            values = list(result)
-            # 文件来自输出根目录的不可变任务目录，使用现有 allowed_paths 文件路由。
-            for index in (2, 3):
-                update = values[index]
-                if isinstance(update, dict) and update.get("value"):
-                    path = Path(update["value"]).resolve()
-                    path.relative_to(output_root.resolve())
-                    file_url = f"{_gradio_public_base_url(request)}/gradio_api/file={quote(path.as_posix(), safe='/')}"
-                    values[index] = {
-                        **update,
-                        "value": FileData(path=str(path), url=file_url, orig_name=path.name).model_dump(mode="json"),
-                    }
-            return json.dumps(
-                {
-                    "run_id": run_id,
-                    "sequence": run.state.sequence,
-                    "ready_at": time.time(),
-                    "outputs": values[:6] + values[7:],
-                },
-                ensure_ascii=False,
-            )
+                return
+            run.set_queue(len(paths))
+
+            def build_receipt(result: tuple[Any, ...], index: int, total: int) -> str:
+                """序列化单个文件的 22 项输出（23 项减去 artifact State），并把本地路径转成可访问的 FileData。"""
+                values = list(result)
+                # 文件来自输出根目录的不可变任务目录，使用现有 allowed_paths 文件路由。
+                for out_index in (2, 3):
+                    update = values[out_index]
+                    if isinstance(update, dict) and update.get("value"):
+                        path = Path(update["value"]).resolve()
+                        path.relative_to(output_root.resolve())
+                        file_url = f"{_gradio_public_base_url(request)}/gradio_api/file={quote(path.as_posix(), safe='/')}"
+                        values[out_index] = {
+                            **update,
+                            "value": FileData(path=str(path), url=file_url, orig_name=path.name).model_dump(mode="json"),
+                        }
+                return json.dumps(
+                    {
+                        "run_id": run_id,
+                        "file_index": index,
+                        "total_files": total,
+                        "terminal": index >= total,
+                        "sequence": run.state.sequence,
+                        "ready_at": time.time(),
+                        "outputs": values[:6] + values[7:],
+                    },
+                    ensure_ascii=False,
+                )
+
+            total = len(paths)
+            for index, file_path in enumerate(paths, start=1):
+                result = await execute_conversion(
+                    run,
+                    file_path,
+                    tier_position,
+                    raw_page_range,
+                    force_ocr,
+                    translation_enabled,
+                    translation_source,
+                    translation_target,
+                    translation_base_url,
+                    translation_model,
+                    translation_api_key,
+                    translation_concurrency,
+                    passed_fingerprint,
+                    request,
+                    index,
+                    total,
+                )
+                # 中途被新提交或取消替换时，停止下发后续文件回执。
+                if conversions.current(session, run_id) is not run:
+                    return
+                yield build_receipt(result, index, total)
 
         for callback in (read_conversion_status, cancel_ui_conversion, unload_session, convert_ui):
             callback.__annotations__["request"] = gr.Request
@@ -1060,14 +1585,29 @@ def build_gradio_app(
             js=(
                 f"() => {{ ({pdf_preview_js('begin')})(); "
                 f"const ticket = ({conversion_js('begin')})(); "
+                f"const resetAll = ({download_reset_js()})(); "
                 f"return [{json.dumps(_status_html(STATUS_PREPARING_REQUEST))}, "
-                f"...({download_js('reset')})(), ...ticket, '', '']; }}"
+                "...resetAll, ...ticket, '', '']; }"
             ),
             **private_event_kwargs,
         )
         ui_convert_event = conversion_ticket.change(
             fn=convert_ui,
-            inputs=[input_file, tier, page_range, force_ocr, conversion_ticket],
+            inputs=[
+                input_file,
+                tier,
+                page_range,
+                force_ocr,
+                translate_enabled,
+                translate_source,
+                translate_target,
+                translate_base_url,
+                translate_model,
+                translate_api_key,
+                translate_concurrency,
+                translate_test_pass,
+                conversion_ticket,
+            ],
             outputs=conversion_receipt,
             queue=True,
             concurrency_limit=None,
@@ -1099,8 +1639,9 @@ def build_gradio_app(
                 "(receipt, source, viewer) => { "
                 f"const values = ({conversion_js('result')})(receipt); "
                 "const pdf = values[2]; "
+                # values[13] 是回执中的 active_run_id（译文输出占用了 6-12 号位），供预览脚本校验任务身份。
                 f"const preview = pdf?.__type__ === 'update' && 'value' in pdf ? ({pdf_preview_js('result')})("
-                "pdf.value, source, viewer, values[6]) : {__type__: 'update'}; "
+                "pdf.value, source, viewer, values[13]) : {__type__: 'update'}; "
                 "return [...values, preview]; }"
             ),
             **private_event_kwargs,
@@ -1154,6 +1695,9 @@ def build_gradio_app(
             office_preview,
             generic_preview,
             artifact_state,
+            translate_output,
+            translate_tab,
+            *translate_download_buttons.values(),
             active_run_id,
             *download_buttons.values(),
             json_output,
@@ -1169,6 +1713,9 @@ def build_gradio_app(
                 gr.update(value="", visible=False),
                 gr.update(value=preview_placeholder("empty_preview"), visible=True),
                 None,
+                "",
+                gr.update(visible=False),
+                *_translation_download_updates(gr, interactive=False, visible=False),
                 *_download_updates(gr, interactive=False),
                 "",
             )
@@ -1189,6 +1736,62 @@ def build_gradio_app(
                 return renderer(state, token, request)
 
             return handler
+
+        def translation_download_handler(format_name: str) -> Callable[..., str | None]:
+            """按格式构造译文渲染处理器；校验当前结果后按需渲染并返回文件路径。"""
+
+            def handler(state: dict[str, Any] | None, run_id: str, request: object | None = None) -> str | None:
+                """使用服务端当前任务核对下载标识，拒绝过期或无译文的请求。"""
+                run = conversions.runs.get(getattr(request, "session_hash", "") or "")
+                if run is not None:
+                    state = run.artifacts if not run.cancelled else None
+                try:
+                    artifacts = RunArtifacts.from_state(state)
+                    if run_id != artifacts.root.name:
+                        raise ValueError("解析结果已变更，请重新下载。")
+                    if artifacts.translation_path is None or not artifacts.translation_path.is_file():
+                        raise ValueError("当前结果没有译文，请先勾选全文翻译后重新解析。")
+                    _ensure_path_inside(artifacts.root, artifacts.translation_path)
+                    return render_translation_download(state, format_name, allowed_root=output_root)
+                except Exception as exc:
+                    logger.warning("WebUI translation download failed format={}: {}", format_name, exc)
+                    return None
+
+            return handler
+
+        for translation_format, _translation_label in _TRANSLATION_DOWNLOAD_FORMATS:
+            translation_handler = translation_download_handler(translation_format)
+            translation_handler.__annotations__["request"] = gr.Request
+            translate_download_buttons[translation_format].click(
+                fn=_download_request_handler,
+                inputs=active_run_id,
+                outputs=translate_download_requests[translation_format],
+                **private_event_kwargs,
+            ).then(
+                fn=translation_handler,
+                inputs=[artifact_state, translate_download_requests[translation_format]],
+                outputs=translate_download_files[translation_format],
+                queue=True,
+                show_progress="hidden",
+                api_visibility="private",
+            ).success(
+                fn=None,
+                inputs=translate_download_files[translation_format],
+                outputs=[],
+                # 译文链路没有普通格式的 complete 回执，这里直接读取 File 值并主动触发浏览器下载。
+                js=(
+                    "(file) => {"
+                    " if (file?.url) {"
+                    "  const anchor = document.createElement('a');"
+                    "  anchor.href = file.url;"
+                    "  anchor.download = file.orig_name || 'translation';"
+                    "  document.body.appendChild(anchor); anchor.click(); anchor.remove();"
+                    " }"
+                    " return [];"
+                    "}"
+                ),
+                **private_event_kwargs,
+            )
 
         for format_name, label in _DOWNLOAD_FORMATS:
             begin_download = download_buttons[format_name].click(

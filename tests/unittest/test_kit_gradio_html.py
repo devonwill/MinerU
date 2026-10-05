@@ -355,7 +355,8 @@ def test_html_images_are_served_by_gradio(tmp_path: Path) -> None:
     output = next(component for component in demo.blocks.values() if "mineru-markdown-output" in (component.elem_classes or []))
     assert isinstance(output, gr.HTML)
     handlers = [fn for fn in demo.fns.values() if fn.name == "handler"]
-    assert len(handlers) == 7 and all(len(fn.inputs) == 2 for fn in handlers)
+    # 12 个下载 handler（7 原文 + 5 译文）输入都是状态与下载票据两件套。
+    assert len(handlers) == 12 and all(len(fn.inputs) == 2 for fn in handlers)
     handler = _download_handler("html", tmp_path / "output")
     path, receipt = handler(
         artifacts.as_state(),

@@ -344,24 +344,28 @@ def test_metadata_does_not_read_non_pdf(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_native_range_components_and_frontend_only_events(tmp_path: Path) -> None:
-    """双滑块联动与档位切换不请求 Python，公开转换输入在页码之后增加 OCR 开关。"""
+    """双滑块联动与档位切换不请求 Python，公开转换输入在页码之后增加 OCR 与翻译参数。"""
     capabilities = V1ServerCapabilities("http://127.0.0.1:1", ("flash", "standard"), ("zip",), ("file_id",))
     demo = gradio_app.build_gradio_app(Mock(), capabilities, output_root=tmp_path, max_pages=20, enable_example=False)
     sliders = [block for block in demo.blocks.values() if block.__class__.__name__ == "Slider"]
-    assert len(sliders) == 3
-    assert sliders[1].elem_classes == ["mineru-page-handle-a"]
-    assert sliders[2].elem_classes == ["mineru-page-handle-b"]
-    for slider in sliders[1:]:
+    assert len(sliders) == 4  # tier / page-handle-a / page-handle-b / translation-concurrency
+    handle_a = next(s for s in sliders if s.elem_classes == ["mineru-page-handle-a"])
+    handle_b = next(s for s in sliders if s.elem_classes == ["mineru-page-handle-b"])
+    for slider in (handle_a, handle_b):
         assert slider.step == 1 and slider.precision == 0
         events = [event for event in demo.config["dependencies"] if (slider._id, "input") in event["targets"]]
         assert len(events) == 1 and events[0]["backend_fn"] is False and events[0]["queue"] is False
         assert events[0]["trigger_mode"] == "always_last"
-        assert len(events[0]["targets"]) == 5
-        assert events[0]["outputs"][:2] == [sliders[1]._id, sliders[2]._id]
+        assert len(events[0]["targets"]) == 7  # 2 page handles + 2 page inputs + tier slider + 2 translation widgets
+        assert events[0]["outputs"][:2] == [handle_a._id, handle_b._id]
     handler = next(fn for fn in demo.fns.values() if fn.name == "convert_handler")
-    assert len(handler.inputs) == 4
+    assert len(handler.inputs) == 12  # file + tier + page_metadata + force_ocr + 8 translation args
     assert handler.inputs[2].__class__.__name__ == "Textbox" and handler.inputs[2].visible is False
     assert handler.inputs[3].__class__.__name__ == "Checkbox" and handler.inputs[3].value is False
+    # 翻译参数在 OCR 开关之后：enable / src_lang / tgt_lang / base_url / model / api_key / concurrency + test_pass state
+    assert handler.inputs[4].__class__.__name__ == "Checkbox"  # 全文翻译开关
+    assert handler.inputs[5].__class__.__name__ == "Dropdown"  # 源语言
+    assert handler.inputs[10].__class__.__name__ == "Slider"  # 并发页数
     metadata_handler = next(fn for fn in demo.fns.values() if fn.name == "read_page_metadata")
     assert metadata_handler.outputs[0].__class__.__name__ == "Textbox"
     metadata = json.loads(metadata_handler.fn(str(_pdf(tmp_path, 12))))

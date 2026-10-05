@@ -143,7 +143,9 @@
     installSizeGuard();
 
     if (action === "begin" || action === "clear") {
-        const file = action === "clear" ? null : args[0];
+        const raw = action === "clear" ? null : args[0];
+        // gr.File 多文件时 args[0] 是数组，预览与票据只跟踪首个文件。
+        const file = Array.isArray(raw) ? raw[0] || null : raw;
         window[key] = (window[key] || 0) + 1;
         window[fileKey] = file ? {path: file.path || "", url: file.url || ""} : null;
         const ticket = {id: window[key], path: file?.path || ""};

@@ -75,9 +75,27 @@ body.dark .gradio-container {
 .mineru-page-values { font-size: 12px; justify-content: center; }
 .mineru-page-selection { font-weight: 600; color: var(--mineru-accent); }
 .mineru-page-axis { position: absolute; bottom: 0; left: 0; right: 0; font-size: 12px; opacity: .7; }
+/* 新布局两端页码已由小输入框承载，隐藏坐标轴首尾数字，仅保留中间提示。 */
+.mineru-page-axis > span:first-child, .mineru-page-axis > span:last-child { display: none; }
+.mineru-page-axis { justify-content: center !important; }
 .mineru-page-summary { position: static !important; }
 .mineru-kit-page-range .mineru-page-axis { bottom: 4px; left: 12px; right: 12px; }
-.mineru-page-sliders { position: relative !important; height: 32px; min-height: 32px !important; gap: 0 !important; }
+/* 一行布局：起止页输入框与中间轨道垂直居中对齐。 */
+.mineru-page-range-row { align-items: center !important; gap: 8px !important; min-height: 32px !important; }
+/* 小页码框：固定窄宽、紧凑高度，去掉 Gradio 数字框的多余留白。 */
+.mineru-page-input-a, .mineru-page-input-b {
+    flex: 0 0 56px !important; width: 56px !important; min-width: 0 !important;
+    padding: 0 !important; gap: 0 !important;
+}
+.mineru-page-input-a .wrap, .mineru-page-input-b .wrap { min-height: 0 !important; }
+.mineru-page-input-a input, .mineru-page-input-b input {
+    height: 28px !important; min-height: 28px !important; padding: 2px 6px !important; text-align: center !important;
+}
+/* 中间轨道容器：列内两个滑块绝对重叠在同一条轨道上。 */
+.mineru-page-sliders {
+    position: relative !important; height: 32px; min-height: 32px !important;
+    gap: 0 !important; padding: 0 !important; min-width: 0 !important;
+}
 .mineru-page-sliders::before {
     content: ""; position: absolute; left: 8px; right: 8px; top: 14px; height: 4px; border-radius: 4px;
     background: linear-gradient(to right,
@@ -87,7 +105,7 @@ body.dark .gradio-container {
 }
 .mineru-page-sliders > .form { position: static !important; }
 .mineru-page-handle-a, .mineru-page-handle-b {
-    position: absolute !important; inset: 0; width: 100% !important; min-width: 0 !important;
+    position: absolute !important; top: 0; left: 0; right: 0; height: 32px; width: 100% !important; min-width: 0 !important;
     padding: 0 !important; border: 0 !important; background: transparent !important; pointer-events: none;
 }
 .mineru-page-handle-a .head, .mineru-page-handle-b .head,

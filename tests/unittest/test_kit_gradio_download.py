@@ -111,8 +111,8 @@ def test_download_event_chain_and_pdf_transport(tmp_path: Path) -> None:
     assert reset()[2]["visible"] is False
     assert reset()[7] == ""
     conversion = next(fn for fn in app.fns.values() if fn.name == "convert_handler")
-    # 浏览器通过票据变化启动普通请求；公开 API 仍保留四个输入与原生文件输出。
-    assert len(conversion.inputs) == 4
+    # 浏览器通过票据变化启动普通请求；公开 API 保留原 4 个输入与 8 个翻译输入。
+    assert len(conversion.inputs) == 12
     ui_conversion = next(fn for fn in app.fns.values() if fn.name == "convert_ui")
     ticket = ui_conversion.inputs[-1]
     reset_dependency = next(
@@ -128,7 +128,8 @@ def test_download_event_chain_and_pdf_transport(tmp_path: Path) -> None:
     )
     assert reset_dependency["outputs"][0] not in reset_on_upload["outputs"]
     assert reset_on_upload["js"] and reset_on_upload["backend_fn"] is False
-    handlers = [fn for fn in app.fns.values() if fn.name == "handler"]
+    # 共 12 个下载 handler：5 个译文（单输出）+ 7 个原文产物（文件与回执成对）。
+    handlers = [fn for fn in app.fns.values() if fn.name == "handler" and len(fn.outputs) == 2]
     assert len(handlers) == 7
     files = []
     for handler in handlers:

@@ -19,7 +19,10 @@ const invoke = vm.runInNewContext(`(${script})`, {
 const equal = (a, b) => assert.equal(JSON.stringify(a), JSON.stringify(b));
 const skipped = (values) => values.every(value => JSON.stringify(value) === '{"__type__":"update"}');
 const status = (id, sequence, terminal = false) => JSON.stringify({ run_id: id, sequence, terminal, html: `stage-${sequence}` });
-const result = (id, sequence, final = 'Completed') => JSON.stringify({ run_id: id, sequence, outputs: Array(15).fill(final) });
+// 与 app.py 对齐：回执 outputs 为 22 项（convert_outputs 23 项减去 artifact State），单文件转换恒为终态回执。
+const result = (id, sequence, final = 'Completed') => JSON.stringify({
+    run_id: id, sequence, file_index: 1, total_files: 1, terminal: true, outputs: Array(22).fill(final),
+});
 for (let index = 0; index < 150; index++) {
     const [ticket, timer] = invoke('begin');
     const first = JSON.parse(ticket);
@@ -39,8 +42,8 @@ for (let index = 0; index < 150; index++) {
     assert.ok(skipped(invoke('status', status(second.run_id, 6))));
     // 终态快照先到时，同序号完整结果仍须被应用一次。
     const final = invoke('result', result(second.run_id, 5, index % 2 ? 'Failed' : 'Completed'));
-    assert.equal(final.length, 16);
-    assert.equal(final[15].active, false);
+    assert.equal(final.length, 23);
+    assert.equal(final[22].active, false);
     assert.equal(listeners.size, 1);
     // 其他 iframe 的加载不能提前移除监听；真实预览加载只记录一次。
     for (const fn of listeners) fn({ target: { matches: () => false } });
@@ -50,7 +53,7 @@ for (let index = 0; index < 150; index++) {
     assert.equal(JSON.parse(logs.at(-1)[1]).run_id, second.run_id);
     assert.ok(skipped(invoke('result', result(second.run_id, 5))));
     const third = JSON.parse(invoke('begin')[0]);
-    assert.equal(invoke('result', result(third.run_id, 4))[15].active, false);
+    assert.equal(invoke('result', result(third.run_id, 4))[22].active, false);
     assert.ok(skipped(invoke('status', status(third.run_id, 3))));
     assert.ok(skipped(invoke('status', status(third.run_id, 4, true))));
 }
@@ -60,7 +63,7 @@ invoke('status', status(failedRun.run_id, 2, true));
 const detailedFailure = 'Failed: page_range_invalid: requested page does not exist';
 const corrected = invoke('result', result(failedRun.run_id, 3, detailedFailure));
 assert.equal(corrected[0], detailedFailure);
-assert.equal(corrected[15].active, false);
+assert.equal(corrected[22].active, false);
 assert.ok(skipped(invoke('status', status(failedRun.run_id, 4, true))));
 console.log('150 lifecycle iterations passed');
 // 非安全上下文（纯 HTTP 局域网访问）没有 randomUUID，降级路径仍须产出服务端 uuid.UUID 可接受的票据。

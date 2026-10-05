@@ -328,10 +328,13 @@ _PREVIEW_KINDS: dict[str, tuple[Callable[[bytes], str], str]] = {
 _EPUB_SUFFIX = ".epub"
 
 
-async def prepare_source_preview(file_path: str | None, ticket: str) -> str:
+async def prepare_source_preview(file_path: str | list[str] | None, ticket: str) -> str:
     """后台生成带请求标识的预览回执，交由浏览器丢弃过期结果。"""
     request = json.loads(ticket)
     result = {"id": request["id"], "html": ""}
+    # gr.File 多文件组件传 list，预览只针对首个文件，先归一化再取后缀。
+    if isinstance(file_path, list):
+        file_path = file_path[0] if file_path else None
     suffix = Path(file_path).suffix.lower() if file_path else ""
     if suffix == _EPUB_SUFFIX and request.get("path") == file_path:
         # EPUB 由浏览器端 viewer 直接读取 Gradio 文件 URL；此处不重复实现 EPUB 解析。

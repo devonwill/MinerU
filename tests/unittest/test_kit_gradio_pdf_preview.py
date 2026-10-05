@@ -45,7 +45,7 @@ def test_pdf_preview_transport_and_success_events(tmp_path: Path) -> None:
         assert previews[0]["trigger_only_on_success"] is True
         assert previews[0]["outputs"] == [viewer._id]
         assert previews[0]["backend_fn"] is False and previews[0]["queue"] is False
-    assert len(conversion.inputs) == 4
+    assert len(conversion.inputs) == 12  # file + tier + page_metadata + force_ocr + 8 translation args
 
 
 @pytest.mark.parametrize("mount", ["", "/mineru"])
